@@ -206,21 +206,37 @@ async def categories(guild: discord.Guild):
 # =========================================================
 
 URL_RE = re.compile(r"^https?://", re.I)
+YOUTUBE_URL_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?v=|shorts/|live/)|youtu\.be/)([A-Za-z0-9_-]{11})",
+    re.I,
+)
 
-YDL_SEARCH_OPTIONS = {
+# YouTube側の仕様変更に備えて、検索用と再生用を分けています。
+# player_client は複数候補を使い、取得できるものを優先します。
+YDL_COMMON_OPTIONS = {
     "quiet": True,
     "no_warnings": True,
     "skip_download": True,
     "noplaylist": True,
+    "ignoreerrors": False,
+    "socket_timeout": 20,
+    "retries": 3,
+    "fragment_retries": 3,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["web_safari", "tv", "web_embedded"],
+        }
+    },
+}
+
+YDL_SEARCH_OPTIONS = {
+    **YDL_COMMON_OPTIONS,
     "default_search": "ytsearch",
     "extract_flat": False,
 }
 
 YDL_STREAM_OPTIONS = {
-    "quiet": True,
-    "no_warnings": True,
-    "skip_download": True,
-    "noplaylist": True,
+    **YDL_COMMON_OPTIONS,
     "format": "bestaudio/best",
 }
 
@@ -266,13 +282,55 @@ def format_duration(seconds: Optional[int]) -> str:
     return f"{minutes}:{sec:02d}"
 
 
+def normalize_youtube_query(query: str) -> str:
+    q = query.strip()
+
+    # DiscordがURLを <...> で囲んでいた場合にも対応
+    if q.startswith("<") and q.endswith(">"):
+        q = q[1:-1].strip()
+
+    match = YOUTUBE_URL_RE.search(q)
+    if match:
+        video_id = match.group(1)
+        return f"https://www.youtube.com/watch?v={video_id}"
+
+    return q
+
+
 def _extract_track_sync(query: str, requester_id: int) -> Track:
-    target = query.strip() if URL_RE.match(query.strip()) else f"ytsearch1:{query.strip()}"
-    with yt_dlp.YoutubeDL(YDL_SEARCH_OPTIONS) as ydl:
-        info = ydl.extract_info(target, download=False)
+    cleaned = normalize_youtube_query(query)
+    if not cleaned:
+        raise RuntimeError("曲名またはURLを入力してください。")
+
+    is_url = bool(URL_RE.match(cleaned))
+    target = cleaned if is_url else f"ytsearch1:{cleaned}"
+
+    last_error = None
+
+    # まず通常取得
+    try:
+        with yt_dlp.YoutubeDL(YDL_SEARCH_OPTIONS) as ydl:
+            info = ydl.extract_info(target, download=False)
+    except Exception as e:
+        info = None
+        last_error = e
+
+    # YouTube URL取得が失敗したときは、動画IDを検索に回して救済
+    if info is None and is_url:
+        match = YOUTUBE_URL_RE.search(cleaned)
+        if match:
+            fallback = f"ytsearch1:{match.group(1)}"
+            try:
+                with yt_dlp.YoutubeDL(YDL_SEARCH_OPTIONS) as ydl:
+                    info = ydl.extract_info(fallback, download=False)
+            except Exception as e:
+                last_error = e
+                info = None
 
     if info is None:
-        raise RuntimeError("曲情報を取得できませんでした。")
+        if last_error:
+            raise RuntimeError(f"YouTubeから曲情報を取得できませんでした: {last_error}")
+        raise RuntimeError("YouTubeから曲情報を取得できませんでした。")
 
     entries = info.get("entries") if hasattr(info, "get") else None
     if entries:
@@ -281,7 +339,19 @@ def _extract_track_sync(query: str, requester_id: int) -> Track:
             raise RuntimeError("検索結果がありませんでした。")
 
     title = str(info.get("title") or "タイトル不明")
-    webpage_url = str(info.get("webpage_url") or info.get("original_url") or info.get("url") or "")
+
+    webpage_url = (
+        info.get("webpage_url")
+        or info.get("original_url")
+        or info.get("url")
+        or cleaned
+    )
+    webpage_url = str(webpage_url)
+
+    # 検索結果が動画IDだけ返した場合はYouTube URLへ直す
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", webpage_url):
+        webpage_url = f"https://www.youtube.com/watch?v={webpage_url}"
+
     if not webpage_url:
         raise RuntimeError("再生URLを取得できませんでした。")
 
@@ -291,7 +361,12 @@ def _extract_track_sync(query: str, requester_id: int) -> Track:
     except (TypeError, ValueError):
         duration = None
 
-    return Track(title=title, webpage_url=webpage_url, requested_by=requester_id, duration=duration)
+    return Track(
+        title=title,
+        webpage_url=webpage_url,
+        requested_by=requester_id,
+        duration=duration,
+    )
 
 
 def _extract_stream_sync(webpage_url: str) -> tuple[str, str, Optional[int]]:
@@ -746,8 +821,14 @@ class AddSongModal(discord.ui.Modal, title="🎵 曲を追加"):
             track = await extract_track(str(self.query).strip(), interaction.user.id)
         except Exception as e:
             log.exception("曲検索失敗")
+            message = str(e).strip()
+            if len(message) > 900:
+                message = message[:900] + "…"
             return await interaction.followup.send(
-                f"曲を取得できませんでした。\n`{type(e).__name__}`",
+                "❌ 選曲できませんでした。\n"
+                f"`{type(e).__name__}`\n"
+                f"```{message or '詳細不明'}```\n"
+                "別のYouTube URLか、曲名検索でも試してみてください。",
                 ephemeral=True,
             )
 
